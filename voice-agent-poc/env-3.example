@@ -1,0 +1,39 @@
+# ============================================================
+#  Voice Agent — Environment Variables
+#  Copy this file to .env and fill in your values
+#  NEVER commit .env to version control
+# ============================================================
+
+# ── LiveKit ─────────────────────────────────────────────────
+LIVEKIT_API_KEY=devkey
+LIVEKIT_API_SECRET=devsecret_change_this_in_production
+
+# ── Whisper ─────────────────────────────────────────────────
+# Options: tiny / base / small / medium / large-v2 / large-v3
+# large-v3 = best Arabic accuracy (~3GB RAM)
+# medium   = good balance of speed vs accuracy (~1.5GB RAM)
+WHISPER_MODEL=large-v3
+
+# ── Ollama / LLM ────────────────────────────────────────────
+# Options: llama3.1 | mistral | qwen2.5 | aya | gemma2
+# For Arabic focus: qwen2.5 or aya recommended
+OLLAMA_MODEL=llama3.1
+OLLAMA_PARALLEL=2
+
+# ── MongoDB ─────────────────────────────────────────────────
+MONGO_USER=voiceagent
+MONGO_PASSWORD=change_this_strong_password
+
+# ── MinIO (S3-compatible storage) ───────────────────────────
+MINIO_ACCESS_KEY=minio_admin
+MINIO_SECRET_KEY=change_this_minio_secret
+
+# ── Redis ───────────────────────────────────────────────────
+REDIS_PASSWORD=change_this_redis_password
+
+# ── API Security ─────────────────────────────────────────────
+API_SECRET_KEY=generate_with__python3_-c__import_secrets__print(secrets.token_hex(32))
+
+# ── CORS ────────────────────────────────────────────────────
+# Comma-separated list of allowed frontend origins
+CORS_ORIGINS=http://localhost:3000,http://localhost:8080
