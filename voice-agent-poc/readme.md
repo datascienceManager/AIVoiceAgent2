@@ -1,5 +1,7 @@
 # Voice Agent POC — Open-Source Stack on Azure
 
+<img src="open_source_voice_agent_azure.svg" width="700" height="1000">
+
 Multilingual voice agent supporting **Arabic · French · English**  
 Fully open-source, runs entirely within Azure Qatar Central — no data leaves the region.
 
