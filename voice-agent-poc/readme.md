@@ -173,3 +173,50 @@ docker compose down -v
 2. Convert this `docker-compose.yml` to Helm charts using `kompose convert`
 3. Deploy to AKS in `qatarcentral` with GPU node pools
 4. See `helm/` directory (coming next) for the production Helm chart
+
+## Additional Info - 
+
+Here's everything you need. The full folder structure to create on your machine:
+
+```
+voice-agent-poc/
+├── docker-compose.yml       ← main compose file
+├── .env.example             ← copy to .env and fill in
+├── README.md                ← setup guide
+├── langchain-api/
+│   ├── main.py              ← FastAPI orchestration service
+│   ├── Dockerfile
+│   └── requirements.txt
+├── nginx/
+│   └── nginx.conf
+└── mongo-init/
+    └── 01_init.js           ← DB setup (runs once on start)
+```
+
+## What's included
+
+The `docker-compose.yml` spins up 11 services in one command:
+
+**Speech** — Whisper `large-v3` for STT (best Arabic accuracy) and Coqui XTTS-v2 for TTS, both multilingual out of the box.
+
+**LLM** — Ollama with an auto-loader that pulls `llama3.1` on startup plus the `nomic-embed-text` embedding model. Switch to `qwen2.5` or `aya` in `.env` for better Arabic quality — just change `OLLAMA_MODEL`.
+
+**Orchestration** — the `langchain-api` service is a fully working FastAPI app (`main.py`) with three endpoints:
+- `POST /turn` — text in, text out (with RAG)
+- `POST /stt` — audio → Whisper transcript
+- `POST /voice-turn` — full pipeline: audio → STT → LLM → TTS response
+
+**Storage** — Qdrant (vector DB with conversation embeddings), MongoDB (full transcript history with a 90-day TTL index), MinIO (audio files), Redis (session cache).
+
+## To get started
+
+```bash
+cp .env.example .env        # fill in passwords
+docker compose pull         # pull all images (~15–20 GB total)
+docker compose up -d        # start everything
+docker compose logs -f      # watch startup (Whisper takes ~60s)
+```
+
+The Swagger API docs will be at `http://localhost:8000/docs` once `langchain-api` is healthy.
+
+The README has the full guide including GPU setup and the Arabic-optimised model table. Want me to write the Helm charts for AKS deployment next?
