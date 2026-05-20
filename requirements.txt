@@ -1,0 +1,20 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+httpx==0.27.2
+pydantic==2.9.2
+
+# LangChain
+langchain==0.3.3
+langchain-ollama==0.2.0
+langchain-qdrant==0.1.4
+langchain-core==0.3.10
+
+# Vector DB
+qdrant-client==1.11.3
+
+# Databases
+motor==3.6.0          # async MongoDB
+redis[asyncio]==5.1.1
+
+# Utilities
+python-multipart==0.0.12   # file uploads in FastAPI

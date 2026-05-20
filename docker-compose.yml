@@ -1,0 +1,416 @@
+# ============================================================
+#  Multilingual Voice Agent — POC Stack
+#  Languages: Arabic · French · English
+#  Deployment target: Local dev → Azure AKS (Qatar Central)
+# ============================================================
+#
+#  Services overview:
+#    livekit        — WebRTC media server (audio in/out)
+#    whisper        — Speech-to-Text (STT), all 3 languages
+#    tts            — Text-to-Speech (Coqui XTTS)
+#    ollama         — LLM runtime (Llama 3 / Mistral)
+#    langchain-api  — Orchestration + RAG API (FastAPI)
+#    qdrant         — Vector database (conversation memory)
+#    mongodb        — Conversation history store
+#    minio          — Audio & transcript object storage
+#    redis          — Session cache & message queue
+#    nginx          — Reverse proxy / entry point
+#
+#  Quick start:
+#    1. cp .env.example .env  (fill in your values)
+#    2. docker compose pull
+#    3. docker compose up -d
+#    4. Visit http://localhost:3000 for the demo UI
+# ============================================================
+
+version: "3.9"
+
+# ── Shared network ──────────────────────────────────────────
+networks:
+  voice-net:
+    driver: bridge
+
+# ── Named volumes ───────────────────────────────────────────
+volumes:
+  qdrant_data:
+  mongodb_data:
+  minio_data:
+  redis_data:
+  ollama_models:
+  whisper_models:
+  tts_models:
+  livekit_config:
+
+# ============================================================
+# SERVICES
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # 1. LIVEKIT — WebRTC media server
+  #    Handles real-time audio streams from web/mobile clients
+  #    Exposes WebRTC + TURN on standard ports
+  # ----------------------------------------------------------
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: voice_livekit
+    restart: unless-stopped
+    ports:
+      - "7880:7880"       # HTTP API
+      - "7881:7881"       # RTC TCP
+      - "7882:7882/udp"   # RTC UDP
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}:${LIVEKIT_API_SECRET}"
+    volumes:
+      - livekit_config:/etc/livekit
+    command: >
+      --config /etc/livekit/livekit.yaml
+      --bind 0.0.0.0
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7880/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ----------------------------------------------------------
+  # 2. WHISPER — Speech-to-Text (STT)
+  #    Self-hosted OpenAI Whisper via whisper-asr-webservice
+  #    Supports ar / fr / en auto-detection
+  #    GPU: set ASR_ENGINE=openai_whisper and add gpu deploy block
+  # ----------------------------------------------------------
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: voice_whisper
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      ASR_MODEL: "${WHISPER_MODEL:-large-v3}"   # large-v3 best for Arabic
+      ASR_ENGINE: openai_whisper
+      # Uncomment for faster-whisper (lower memory, similar accuracy):
+      # ASR_ENGINE: faster_whisper
+    volumes:
+      - whisper_models:/root/.cache/whisper
+    networks:
+      - voice-net
+    # ── GPU support (uncomment when running on GPU host) ──
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s   # Whisper model loading takes time
+
+  # ----------------------------------------------------------
+  # 3. COQUI TTS — Text-to-Speech
+  #    Neural TTS supporting Arabic, French, English
+  #    XTTS-v2 model: voice cloning + multilingual
+  # ----------------------------------------------------------
+  tts:
+    image: ghcr.io/coqui-ai/tts:latest
+    container_name: voice_tts
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    environment:
+      COQUI_TOS_AGREED: "1"
+    volumes:
+      - tts_models:/root/.local/share/tts
+    command: >
+      --model_name tts_models/multilingual/multi-dataset/xtts_v2
+      --use_cuda false
+    networks:
+      - voice-net
+    # ── GPU support ──
+    # command: >
+    #   --model_name tts_models/multilingual/multi-dataset/xtts_v2
+    #   --use_cuda true
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s  # XTTS model loading is slow on first run
+
+  # ----------------------------------------------------------
+  # 4. OLLAMA — LLM runtime
+  #    Serves Llama 3, Mistral, Qwen, or Jais
+  #    OpenAI-compatible /api/chat endpoint
+  #    Pull models via: docker exec voice_ollama ollama pull llama3
+  # ----------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: voice_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_NUM_PARALLEL: "${OLLAMA_PARALLEL:-2}"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+    networks:
+      - voice-net
+    # ── GPU support ──
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # 5. OLLAMA MODEL LOADER — runs once on startup
+  #    Pulls the configured LLM model automatically
+  #    Change OLLAMA_MODEL in .env to switch models:
+  #      llama3.1          — best all-round (8B, ~5GB)
+  #      mistral           — fast & good Arabic (7B, ~4GB)
+  #      qwen2.5           — excellent Arabic (7B, ~4GB)
+  #      aya               — multilingual incl. Arabic (8B)
+  # ----------------------------------------------------------
+  ollama-model-loader:
+    image: ollama/ollama:latest
+    container_name: voice_ollama_loader
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: >
+      sh -c "ollama pull ${OLLAMA_MODEL:-llama3.1} &&
+             ollama pull nomic-embed-text &&
+             echo 'Models loaded successfully'"
+    networks:
+      - voice-net
+
+  # ----------------------------------------------------------
+  # 6. LANGCHAIN API — Orchestration + RAG (FastAPI)
+  #    The brain: receives text from Whisper, retrieves context
+  #    from Qdrant, calls Ollama, returns response to TTS
+  #    Source: ./langchain-api/  (build locally)
+  # ----------------------------------------------------------
+  langchain-api:
+    build:
+      context: ./langchain-api
+      dockerfile: Dockerfile
+    image: voice-langchain-api:latest
+    container_name: voice_orchestrator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # LLM
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.1}"
+      OLLAMA_EMBED_MODEL: "nomic-embed-text"
+      # Vector DB
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_COLLECTION: "voice_conversations"
+      # Conversation store
+      MONGODB_URL: "mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017"
+      MONGODB_DB: "voice_agent"
+      # Session cache
+      REDIS_URL: "redis://redis:6379"
+      # Speech services
+      WHISPER_URL: "http://whisper:9000"
+      TTS_URL: "http://tts:5002"
+      # Storage
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY}"
+      MINIO_BUCKET_AUDIO: "audio-transcripts"
+      # Languages
+      SUPPORTED_LANGUAGES: "ar,fr,en"
+      DEFAULT_LANGUAGE: "ar"
+      # Security
+      API_SECRET_KEY: "${API_SECRET_KEY}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:3000}"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      whisper:
+        condition: service_healthy
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # 7. QDRANT — Vector database
+  #    Stores conversation embeddings for semantic retrieval
+  #    Persisted to named volume
+  # ----------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: voice_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # HTTP API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__LOG_LEVEL: INFO
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # 8. MONGODB — Conversation history store
+  #    Full turn-by-turn transcripts, session metadata,
+  #    language preferences, user profiles
+  # ----------------------------------------------------------
+  mongodb:
+    image: mongo:7
+    container_name: voice_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_USER}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_PASSWORD}"
+      MONGO_INITDB_DATABASE: "voice_agent"
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # 9. MINIO — Object storage (S3-compatible)
+  #    Stores raw audio recordings and STT transcripts
+  #    UI available at http://localhost:9001
+  # ----------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: voice_minio
+    restart: unless-stopped
+    ports:
+      - "9010:9000"   # S3 API (mapped to 9010 to avoid Whisper port conflict)
+      - "9001:9001"   # MinIO Console UI
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ACCESS_KEY}"
+      MINIO_ROOT_PASSWORD: "${MINIO_SECRET_KEY}"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO bucket initializer — creates required buckets on startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: voice_minio_init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} &&
+        mc mb --ignore-existing local/audio-transcripts &&
+        mc mb --ignore-existing local/tts-outputs &&
+        echo 'MinIO buckets ready'
+      "
+    networks:
+      - voice-net
+
+  # ----------------------------------------------------------
+  # 10. REDIS — Session cache + message queue
+  #     Caches active sessions and language preferences
+  #     Used as Celery broker if async task queue is needed
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: voice_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD}"
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # 11. NGINX — Reverse proxy / single entry point
+  #     Routes /api → langchain-api
+  #     Routes /ws  → livekit
+  #     Routes /    → demo UI (port 3000)
+  #     TLS termination point for production
+  # ----------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: voice_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - langchain-api
+      - livekit
+    networks:
+      - voice-net
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
